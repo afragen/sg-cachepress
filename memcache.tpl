@@ -3,9 +3,9 @@
 /*
 Plugin Name: Memcached
 Description: Memcached backend for the WP Object Cache.
-Version: 2.0.2
+Version: 3.0.1
 Plugin URI: http://wordpress.org/extend/plugins/memcached/
-Author: Ryan Boren, Denis de Bernardy, Matt Martz
+Author: Ryan Boren, Denis de Bernardy, Matt Martz, Andy Skelton
 
 Install this file to wp-content/object-cache.php
 */
@@ -79,6 +79,12 @@ function wp_cache_set($key, $data, $group = '', $expire = 0) {
 		return $wp_object_cache->delete($key, $group);
 }
 
+function wp_cache_switch_to_blog( $blog_id ) {
+    global $wp_object_cache;
+
+    return $wp_object_cache->switch_to_blog( $blog_id );
+}
+
 function wp_cache_add_global_groups( $groups ) {
 	global $wp_object_cache;
 
@@ -92,19 +98,16 @@ function wp_cache_add_non_persistent_groups( $groups ) {
 }
 
 class WP_Object_Cache {
-	var $global_groups = array();
+	var $global_groups = array('WP_Object_Cache_global');
 
 	var $no_mc_groups = array();
 
 	var $cache = array();
 	var $mc = array();
-	var $stats = array(
-		'add'       => 0,
-		'delete'    => 0,
-		'get'       => 0,
-		'get_multi' => 0,
-	);
+	var $stats = array();
 	var $group_ops = array();
+	var $flush_number = array();
+	var $global_flush_number = null;
 
 	var $cache_enabled = true;
 	var $default_expiration = 0;
@@ -193,14 +196,25 @@ class WP_Object_Cache {
 	}
 
 	function flush() {
-		// Don't flush if multi-blog.
-		if ( function_exists('is_site_admin') || defined('CUSTOM_USER_TABLE') && defined('CUSTOM_USER_META_TABLE') )
-			return true;
-
-		$ret = true;
-		foreach ( array_keys($this->mc) as $group )
-			$ret &= $this->mc[$group]->flush();
-		return $ret;
+		// Do not use the memcached flush method. It acts on an
+		// entire memcached server, affecting all sites.
+		// Flush is also unusable in some setups, e.g. twemproxy.
+		// Instead, rotate the key prefix for the current site.
+		// Global keys are rotated when flushing on the main site.
+		$this->cache = array();
+		$this->rotate_site_keys();
+		if ( is_main_site() )
+			$this->rotate_global_keys();
+	}
+	
+	function rotate_site_keys() {
+	    $this->add( 'flush_number', intval(microtime(true) * 1e6), 'WP_Object_Cache' );
+	    $this->flush_number[ $this->blog_prefix ] = $this->incr( 'flush_number', 1, 'WP_Object_Cache' );
+	}
+	
+	function rotate_global_keys() {
+	    $this->add( 'flush_number', intval(microtime(true) * 1e6), 'WP_Object_Cache_global' );
+	    $this->global_flush_number = $this->incr( 'flush_number', 1, 'WP_Object_Cache_global' );
 	}
 
 	function get($id, $group = 'default', $force = false) {
@@ -264,15 +278,39 @@ class WP_Object_Cache {
 		$this->cache = array_merge( $this->cache, $return );
 		return $return;
 	}
+	
+	function flush_prefix( $group ) {
+	    if ( $group === 'WP_Object_Cache' || $group === 'WP_Object_Cache_global' ) {
+	        // Never flush the flush numbers.
+	        $number = '_';
+	    } elseif ( false !== array_search($group, $this->global_groups) ) {
+	        if ( ! isset( $this->global_flush_number ) )
+	            $this->global_flush_number = intval( $this->get('flush_number', 'WP_Object_Cache_global') );
+	            if ( $this->global_flush_number === 0 )
+	                $this->rotate_global_keys();
+	                $number = $this->global_flush_number;
+	    } else {
+	        if ( ! isset( $this->flush_number[ $this->blog_prefix ] ) )
+	            $this->flush_number[ $this->blog_prefix ] = intval( $this->get('flush_number', 'WP_Object_Cache') );
+	            if ( $this->flush_number[ $this->blog_prefix ] === 0 )
+	                $this->rotate_site_keys();
+	                $number = $this->flush_number[ $this->blog_prefix ];
+	    }
+	    return $number . ':';
+	}
 
 	function key($key, $group) {	
 		if ( empty($group) )
 			$group = 'default';
 
+		$prefix = $this->key_salt;
+
+		$prefix .= $this->flush_prefix( $group );
+
 		if ( false !== array_search($group, $this->global_groups) )
-			$prefix = $this->global_prefix;
+			$prefix .= $this->global_prefix;
 		else
-			$prefix = $this->blog_prefix;
+			$prefix .= $this->blog_prefix;
 
 		return preg_replace('/\s+/', '', substr(md5(dirname(__FILE__)),7) . "$prefix$group:$key");
 	}
@@ -309,6 +347,12 @@ class WP_Object_Cache {
 		$result = $mc->set($key, $data, false, $expire);
 
 		return $result;
+	}
+	
+	function switch_to_blog( $blog_id ) {
+	    global $table_prefix;
+	    $blog_id = (int) $blog_id;
+	    $this->blog_prefix = ( is_multisite() ? $blog_id : $table_prefix );
 	}
 
 	function colorize_debug_line($line) {
@@ -365,6 +409,13 @@ class WP_Object_Cache {
 			unlink($dropInLocation);
 			return;
 		}
+	}
+	
+	function salt_keys( $key_salt ) {
+	    if ( strlen( $key_salt ) )
+            $this->key_salt = $key_salt . ':';
+        else
+            $this->key_salt = '';
 	}
 
 	function __construct() {
