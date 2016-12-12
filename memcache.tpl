@@ -108,6 +108,24 @@ class WP_Object_Cache {
 
 	var $cache_enabled = true;
 	var $default_expiration = 0;
+	
+	function check_data_size( $data ) {
+	    if (is_array($data) || is_object($data)) {
+	        $data = serialize($data);
+	    }
+	
+	    if (function_exists('mb_strlen')) {
+	        $size = mb_strlen($data, '8bit');
+	    } else {
+	        $size = strlen($data);
+	    }
+	
+	    if ($size > 1000000) {
+	        return false;
+	    }
+	
+	    return true;
+	}
 
 	function add($id, $data, $group = 'default', $expire = 0) {
 		$key = $this->key($id, $group);
@@ -124,7 +142,12 @@ class WP_Object_Cache {
 
 		$mc =& $this->get_mc($group);
 		$expire = ($expire == 0) ? $this->default_expiration : $expire;
-		$result = $mc->add($key, $data, false, $expire);
+		
+		if ($this->check_data_size($data)) {
+		    $result = $mc->add($key, $data, false, $expire);
+		} else {
+		    $result = false;
+		}
 
 		if ( false !== $result ) {
 			@ ++$this->stats['add'];
@@ -285,7 +308,12 @@ class WP_Object_Cache {
 		if ( is_object( $data ) )
 			$data = clone $data;
 
-		$result = $mc->replace($key, $data, false, $expire);
+		if ($this->check_data_size($data)) {
+		    $result = $mc->replace($key, $data, false, $expire);
+		} else {
+		    $result = false;
+		}
+		
 		if ( false !== $result )
 			$this->cache[$key] = $data;
 		return $result;
@@ -306,7 +334,12 @@ class WP_Object_Cache {
 
 		$expire = ($expire == 0) ? $this->default_expiration : $expire;
 		$mc =& $this->get_mc($group);
-		$result = $mc->set($key, $data, false, $expire);
+		
+		if ($this->check_data_size($data)) {
+		    $result = $mc->set($key, $data, false, $expire);
+		} else {
+		    $result = false;
+		}
 
 		return $result;
 	}
