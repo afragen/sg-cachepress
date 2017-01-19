@@ -3,9 +3,9 @@
 /*
 Plugin Name: Memcached
 Description: Memcached backend for the WP Object Cache.
-Version: 2.0.2
+Version: 3.0.1
 Plugin URI: http://wordpress.org/extend/plugins/memcached/
-Author: Ryan Boren, Denis de Bernardy, Matt Martz
+Author: Ryan Boren, Denis de Bernardy, Matt Martz, Andy Skelton
 
 Install this file to wp-content/object-cache.php
 */
@@ -79,6 +79,12 @@ function wp_cache_set($key, $data, $group = '', $expire = 0) {
 		return $wp_object_cache->delete($key, $group);
 }
 
+function wp_cache_switch_to_blog( $blog_id ) {
+	global $wp_object_cache;
+
+	return $wp_object_cache->switch_to_blog( $blog_id );
+}
+
 function wp_cache_add_global_groups( $groups ) {
 	global $wp_object_cache;
 
@@ -92,19 +98,21 @@ function wp_cache_add_non_persistent_groups( $groups ) {
 }
 
 class WP_Object_Cache {
-	var $global_groups = array();
+	var $global_groups = array( 'WP_Object_Cache_global' );
 
 	var $no_mc_groups = array();
 
 	var $cache = array();
 	var $mc = array();
 	var $stats = array(
-		'add'       => 0,
-		'delete'    => 0,
-		'get'       => 0,
-		'get_multi' => 0,
-	);
+        'add'       => 0,
+        'delete'    => 0,
+        'get'       => 0,
+        'get_multi' => 0,
+    );
 	var $group_ops = array();
+	var $flush_number = array();
+	var $global_flush_number = null;
 
 	var $cache_enabled = true;
 	var $default_expiration = 0;
@@ -154,7 +162,7 @@ class WP_Object_Cache {
 	function incr($id, $n = 1, $group = 'default' ) {
 		$key = $this->key($id, $group);
 		$mc =& $this->get_mc($group);
-		$this->cache[ $key ] = $mc->increment( $key, $n );	
+		$this->cache[ $key ] = $mc->increment( $key, $n );
 		return $this->cache[ $key ];
 	}
 
@@ -189,18 +197,29 @@ class WP_Object_Cache {
 		if ( false !== $result )
 			unset($this->cache[$key]);
 
-		return $result; 
+		return $result;
 	}
 
 	function flush() {
-		// Don't flush if multi-blog.
-		if ( function_exists('is_site_admin') || defined('CUSTOM_USER_TABLE') && defined('CUSTOM_USER_META_TABLE') )
-			return true;
+		// Do not use the memcached flush method. It acts on an
+		// entire memcached server, affecting all sites.
+		// Flush is also unusable in some setups, e.g. twemproxy.
+		// Instead, rotate the key prefix for the current site.
+		// Global keys are rotated when flushing on the main site.
+		$this->cache = array();
+		$this->rotate_site_keys();
+		if ( is_main_site() )
+			$this->rotate_global_keys();
+	}
 
-		$ret = true;
-		foreach ( array_keys($this->mc) as $group )
-			$ret &= $this->mc[$group]->flush();
-		return $ret;
+	function rotate_site_keys() {
+		$this->add( 'flush_number', intval(microtime(true) * 1e6), 'WP_Object_Cache' );
+		$this->flush_number[ $this->blog_prefix ] = $this->incr( 'flush_number', 1, 'WP_Object_Cache' );
+	}
+
+	function rotate_global_keys() {
+		$this->add( 'flush_number', intval(microtime(true) * 1e6), 'WP_Object_Cache_global' );
+		$this->global_flush_number = $this->incr( 'flush_number', 1, 'WP_Object_Cache_global' );
 	}
 
 	function get($id, $group = 'default', $force = false) {
@@ -265,16 +284,40 @@ class WP_Object_Cache {
 		return $return;
 	}
 
-	function key($key, $group) {	
+	function flush_prefix( $group ) {
+		if ( $group === 'WP_Object_Cache' || $group === 'WP_Object_Cache_global' ) {
+			// Never flush the flush numbers.
+			$number = '_';
+		} elseif ( false !== array_search($group, $this->global_groups) ) {
+			if ( ! isset( $this->global_flush_number ) )
+				$this->global_flush_number = intval( $this->get('flush_number', 'WP_Object_Cache_global') );
+			if ( $this->global_flush_number === 0 )
+				$this->rotate_global_keys();
+			$number = $this->global_flush_number;
+		} else {
+			if ( ! isset( $this->flush_number[ $this->blog_prefix ] ) )
+				$this->flush_number[ $this->blog_prefix ] = intval( $this->get('flush_number', 'WP_Object_Cache') );
+			if ( $this->flush_number[ $this->blog_prefix ] === 0 )
+				$this->rotate_site_keys();
+			$number = $this->flush_number[ $this->blog_prefix ];
+		}
+		return $number . ':';
+	}
+
+	function key($key, $group) {
 		if ( empty($group) )
 			$group = 'default';
 
-		if ( false !== array_search($group, $this->global_groups) )
-			$prefix = $this->global_prefix;
-		else
-			$prefix = $this->blog_prefix;
+		$prefix = $this->key_salt;
 
-		return preg_replace('/\s+/', '', substr(md5(dirname(__FILE__)),7) . "$prefix$group:$key");
+		$prefix .= $this->flush_prefix( $group );
+
+		if ( false !== array_search($group, $this->global_groups) )
+			$prefix .= $this->global_prefix;
+		else
+			$prefix .= $this->blog_prefix;
+
+	return preg_replace('/\s+/', '', substr(md5(dirname(__FILE__)),7) . "$prefix$group:$key");
 	}
 
 	function replace($id, $data, $group = 'default', $expire = 0) {
@@ -311,6 +354,12 @@ class WP_Object_Cache {
 		return $result;
 	}
 
+	function switch_to_blog( $blog_id ) {
+		global $table_prefix;
+		$blog_id = (int) $blog_id;
+		$this->blog_prefix = ( is_multisite() ? $blog_id : $table_prefix );
+	}
+
 	function colorize_debug_line($line) {
 		$colors = array(
 			'get' => 'green',
@@ -334,22 +383,19 @@ class WP_Object_Cache {
 		echo "</p>\n";
 		echo "<h3>Memcached:</h3>";
 		foreach ( $this->group_ops as $group => $ops ) {
-			if ( !isset($_GET['debug_queries']) && 500 < count($ops) ) { 
-				$ops = array_slice( $ops, 0, 500 ); 
+			if ( !isset($_GET['debug_queries']) && 500 < count($ops) ) {
+				$ops = array_slice( $ops, 0, 500 );
 				echo "<big>Too many to show! <a href='" . add_query_arg( 'debug_queries', 'true' ) . "'>Show them anyway</a>.</big>\n";
-			} 
+			}
 			echo "<h4>$group commands</h4>";
 			echo "<pre>\n";
 			$lines = array();
 			foreach ( $ops as $op ) {
-				$lines[] = $this->colorize_debug_line($op); 
+				$lines[] = $this->colorize_debug_line($op);
 			}
 			print_r($lines);
 			echo "</pre>\n";
 		}
-
-		if ( $this->debug )
-			var_dump($this->memcache_debug);
 	}
 
 	function &get_mc($group) {
@@ -359,21 +405,31 @@ class WP_Object_Cache {
 	}
 
 	function failure_callback($host, $port) {
-		$dropInLocation = dirname(__FILE__). '/object-cache.php';
-		if (is_readable($dropInLocation))
-		{
-			unlink($dropInLocation);
-			return;
-		}
+	    function failure_callback($host, $port) {
+        $dropInLocation = dirname(__FILE__). '/object-cache.php';
+        if (is_readable($dropInLocation))
+        {
+            unlink($dropInLocation);
+            return;
+        }
+    }
+	}
+
+	function salt_keys( $key_salt ) {
+		if ( strlen( $key_salt ) )
+			$this->key_salt = $key_salt . ':';
+		else
+			$this->key_salt = '';
 	}
 
 	function __construct() {
+		global $memcached_servers;
 
-		$memcached_servers = array(
-				'default' => array(
+        $memcached_servers = array(
+                'default' => array(
 '@changedefaults@'
-				)
-			);
+                )
+            );
 
 		if ( isset($memcached_servers) )
 			$buckets = $memcached_servers;
@@ -387,12 +443,17 @@ class WP_Object_Cache {
 		foreach ( $buckets as $bucket => $servers) {
 			$this->mc[$bucket] = new Memcache();
 			foreach ( $servers as $server  ) {
-				list ( $node, $port ) = explode(':', $server);
-				if ( !$port )
-					$port = ini_get('memcache.default_port');
-				$port = intval($port);
-				if ( !$port )
-					$port = 11211;
+				if ( 'unix://' == substr( $server, 0, 7 ) ) {
+					$node = $server;
+					$port = 0;
+				} else {
+					list ( $node, $port ) = explode(':', $server);
+					if ( !$port )
+						$port = ini_get('memcache.default_port');
+					$port = intval($port);
+					if ( !$port )
+						$port = 11211;
+				}
 				$this->mc[$bucket]->addServer($node, $port, true, 1, 1, 15, true, array($this, 'failure_callback'));
 				$this->mc[$bucket]->setCompressThreshold(20000, 0.2);
 			}
@@ -403,12 +464,12 @@ class WP_Object_Cache {
 		$this->blog_prefix = '';
 		if ( function_exists( 'is_multisite' ) ) {
 			$this->global_prefix = ( is_multisite() || defined('CUSTOM_USER_TABLE') && defined('CUSTOM_USER_META_TABLE') ) ? '' : $table_prefix;
-			$this->blog_prefix = ( is_multisite() ? $blog_id : $table_prefix ) . ':';
+			$this->blog_prefix = ( is_multisite() ? $blog_id : $table_prefix );
 		}
 
 		$this->cache_hits =& $this->stats['get'];
 		$this->cache_misses =& $this->stats['add'];
 	}
 }
-
 }
+?>
