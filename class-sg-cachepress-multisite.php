@@ -88,7 +88,7 @@ class SG_CachePress_Multisite {
 
 		$force  = ( '1' === get_option( 'sg_cachepress_ssl_enabled' ) );
 		$method = $_SERVER['REQUEST_METHOD'];
-		$cli    = 'cli' === php_sapi_name();
+		$cli    = ( defined( 'WP_CLI' ) && WP_CLI );
 
 		if ( ! $force || 'GET' !== $method || is_ssl() || $cli ) {
 			return;
